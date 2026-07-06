@@ -18,6 +18,14 @@ Cloud Container (Render / Koyeb / HF Spaces)
 └── Phase 2 — Sender (sorted)
     Neon DB (ORDER BY name, year, resolution_rank)
     → copy_message() → FloodWait handler → mark 'sent'
+PORT=8080
+API_ID=1234567
+API_HASH=abcdef1234567890abcdef1234567890
+BOT_TOKEN=1234567890:ABCDEFGHIJKLMNOPQRSTUVWXYZ
+SOURCE_CHAT_ID=-1001111111111
+DEST_CHAT_ID=-1002222222222
+DATABASE_URL=postgresql://rajdev:mypassword123@ep-muddy-water-9876.us-east-2.aws.neon.tech/astratoonix_db?sslmode=require
+
 ```
 
 ---
