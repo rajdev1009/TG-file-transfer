@@ -20,7 +20,7 @@ from typing import Optional
 import asyncpg
 from aiohttp import web
 from dotenv import load_dotenv
-from pyrogram import Client, errors
+from pyrogram import Client, errors, filters
 from pyrogram.types import Message
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -59,9 +59,12 @@ class Config:
         if not self.SESSION_STRING and not self.BOT_TOKEN:
             raise ValueError("Set either SESSION_STRING or BOT_TOKEN in env vars.")
 
-        # --- Channels ---
-        self.SOURCE_CHAT_ID: int = self._require_int("SOURCE_CHAT_ID")
-        self.DEST_CHAT_ID: int = self._require_int("DEST_CHAT_ID")
+        # --- Channels (Made Optional for Dynamic Setup via Commands) ---
+        src = os.environ.get("SOURCE_CHAT_ID")
+        self.SOURCE_CHAT_ID: Optional[int] = int(src) if src else None
+
+        dst = os.environ.get("DEST_CHAT_ID")
+        self.DEST_CHAT_ID: Optional[int] = int(dst) if dst else None
 
         # --- Database ---
         self.DATABASE_URL: str = self._require("DATABASE_URL")
@@ -84,6 +87,8 @@ class Config:
 
 config = Config()
 
+# Global state to prevent overlapping transfers
+TRANSFER_RUNNING = False
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 2.  Database Layer  (asyncpg + Neon DB / PostgreSQL)
@@ -299,6 +304,10 @@ async def phase_scrape(client: Client, db: Database) -> None:
     Iterate every message in SOURCE_CHAT_ID.
     For each document / video / audio, extract metadata and upsert to DB.
     """
+    if not config.SOURCE_CHAT_ID:
+        log.error("Source Chat ID is not set!")
+        return
+
     log.info("═" * 60)
     log.info("PHASE 1 — Scraping source channel …")
     log.info("═" * 60)
@@ -351,6 +360,10 @@ async def phase_send(client: Client, db: Database) -> None:
     copy each message to DEST_CHAT_ID, then mark as 'sent'.
     Handles FloodWait and network errors gracefully.
     """
+    if not config.DEST_CHAT_ID or not config.SOURCE_CHAT_ID:
+        log.error("Chat IDs are not set!")
+        return
+
     log.info("═" * 60)
     log.info("PHASE 2 — Sending files (sorted) …")
     log.info("═" * 60)
@@ -423,7 +436,73 @@ async def _copy_with_retry(client: Client, message_id: int, label: str) -> bool:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 7.  aiohttp Health-check web server
+# 7.  Pipeline Runner & Dynamic Command Handlers
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def run_pipeline(client: Client, db: Database, message: Optional[Message] = None):
+    global TRANSFER_RUNNING
+    TRANSFER_RUNNING = True
+    try:
+        stats_before = await db.stats()
+        if stats_before["total"] == 0:
+            log.info("No records in DB — starting fresh scrape.")
+            if message:
+                await message.reply("Phase 1: Scraping source channel started... ⏳")
+            await phase_scrape(client, db)
+        else:
+            log.info(f"DB already has {stats_before['total']:,} records. Skipping Phase 1.")
+            if message:
+                await message.reply(f"DB already has {stats_before['total']:,} records. Skipping Phase 1.\nPhase 2: Sending files started... 🚀")
+            log.info("  → To force a re-scrape, truncate the tg_files table manually.")
+
+        await phase_send(client, db)
+        if message:
+            await message.reply("✅ AstraToonix Bulk Transfer Finished Successfully! Saari files sort hoke aa chuki hain.")
+    except Exception as exc:
+        log.exception(f"Fatal error in pipeline: {exc}")
+        if message:
+            await message.reply(f"❌ Error in pipeline: {exc}")
+    finally:
+        TRANSFER_RUNNING = False
+
+
+def register_handlers(client: Client, db: Database):
+    @client.on_message(filters.command("send") & filters.private)
+    async def set_source(c: Client, message: Message):
+        if not message.reply_to_message or not message.reply_to_message.forward_from_chat:
+            await message.reply("Bhai, pehle Source channel se koi file forward karo, phir us forward kiye hue message par reply karke /send likho.")
+            return
+        
+        config.SOURCE_CHAT_ID = message.reply_to_message.forward_from_chat.id
+        channel_title = message.reply_to_message.forward_from_chat.title
+        await message.reply(f"✅ Source Channel Set!\nName: {channel_title}\nID: {config.SOURCE_CHAT_ID}")
+
+    @client.on_message(filters.command("receive") & filters.private)
+    async def set_dest(c: Client, message: Message):
+        if not message.reply_to_message or not message.reply_to_message.forward_from_chat:
+            await message.reply("Bhai, pehle Destination channel se koi file forward karo, phir us forward kiye hue message par reply karke /receive likho.")
+            return
+        
+        config.DEST_CHAT_ID = message.reply_to_message.forward_from_chat.id
+        channel_title = message.reply_to_message.forward_from_chat.title
+        await message.reply(f"✅ Destination Channel Set!\nName: {channel_title}\nID: {config.DEST_CHAT_ID}")
+
+    @client.on_message(filters.command("start_transfer") & filters.private)
+    async def trigger_transfer(c: Client, message: Message):
+        global TRANSFER_RUNNING
+        if not config.SOURCE_CHAT_ID or not config.DEST_CHAT_ID:
+            await message.reply("⚠️ Pehle /send aur /receive command use karke dono channels set karo!")
+            return
+        if TRANSFER_RUNNING:
+            await message.reply("⚠️ Transfer is already running in the background!")
+            return
+        
+        await message.reply("🚀 AstraToonix Bulk Transfer Started! Process running in background.")
+        asyncio.create_task(run_pipeline(c, db, message))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 8.  aiohttp Health-check web server
 # ──────────────────────────────────────────────────────────────────────────────
 
 async def handle_health(request: web.Request) -> web.Response:
@@ -449,26 +528,19 @@ async def handle_trigger(request: web.Request) -> web.Response:
     app = request.app
     client: Client = app["client"]
     db: Database = app["db"]
+    global TRANSFER_RUNNING
 
-    if app.get("transfer_running"):
+    if TRANSFER_RUNNING:
         return web.json_response({"message": "Transfer already in progress."}, status=409)
 
-    async def _run():
-        app["transfer_running"] = True
-        try:
-            await phase_send(client, db)
-        finally:
-            app["transfer_running"] = False
-
-    asyncio.create_task(_run())
-    return web.json_response({"message": "Phase 2 started in background."})
+    asyncio.create_task(run_pipeline(client, db))
+    return web.json_response({"message": "Pipeline started in background."})
 
 
 def build_web_app(client: Client, db: Database) -> web.Application:
     app = web.Application()
     app["client"] = client
     app["db"] = db
-    app["transfer_running"] = False
     app.router.add_get("/", handle_health)
     app.router.add_get("/health", handle_health)
     app.router.add_post("/run", handle_trigger)
@@ -476,7 +548,7 @@ def build_web_app(client: Client, db: Database) -> web.Application:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 8.  Entry point — orchestrates everything
+# 9.  Entry point — orchestrates everything
 # ──────────────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
@@ -484,19 +556,19 @@ async def main() -> None:
     log.info("│      TG BULK TRANSFER BOT  —  Starting up       │")
     log.info("└─────────────────────────────────────────────────┘")
     log.info(f"  Web server port : {config.PORT}")
-    log.info(f"  Source chat     : {config.SOURCE_CHAT_ID}")
-    log.info(f"  Destination     : {config.DEST_CHAT_ID}")
-    log.info(f"  Copy delay      : {config.COPY_DELAY}s")
 
     # ── Connect DB ───────────────────────────────────────────────────────────
     db = Database(config.DATABASE_URL)
     await db.connect()
 
-    # ── Connect Telegram ─────────────────────────────────────────────────────
+    # ── Connect Telegram & Register Handlers ─────────────────────────────────
     client = build_client()
+    register_handlers(client, db)
     await client.start()
+    
     me = await client.get_me()
     log.info(f"  Logged in as    : {me.first_name} (@{me.username})")
+    log.info("  Awaiting dynamic channel setup via /send and /receive commands.")
 
     # ── Build & start web server ──────────────────────────────────────────────
     web_app = build_web_app(client, db)
@@ -506,38 +578,18 @@ async def main() -> None:
     await site.start()
     log.info(f"  Health server   : http://0.0.0.0:{config.PORT}/health")
 
-    # ── Run transfer pipeline ─────────────────────────────────────────────────
     try:
-        # Phase 1: scrape & store metadata (skip if all already scraped)
-        stats_before = await db.stats()
-        if stats_before["total"] == 0:
-            log.info("No records in DB — starting fresh scrape.")
-            await phase_scrape(client, db)
-        else:
-            log.info(
-                f"DB already has {stats_before['total']:,} records "
-                f"({stats_before['pending']:,} pending). Skipping Phase 1."
-            )
-            log.info("  → To force a re-scrape, truncate the tg_files table manually.")
-
-        # Phase 2: sort & send
-        await phase_send(client, db)
-
+        # Keep web server and bot alive waiting for commands
+        await asyncio.Event().wait()
     except (KeyboardInterrupt, SystemExit):
         log.info("Shutdown signal received.")
     except Exception as exc:
-        log.exception(f"Fatal error in pipeline: {exc}")
+        log.exception(f"Fatal error in startup: {exc}")
     finally:
-        # Keep web server alive even after transfer finishes
-        # (cloud platforms need an always-running process)
-        log.info("Pipeline finished. Web server stays up for health checks.")
-        await asyncio.Event().wait()  # blocks forever until process is killed
-
-    # ── Cleanup (reached only on forced exit) ────────────────────────────────
-    await runner.cleanup()
-    await client.stop()
-    await db.close()
-    log.info("Shutdown complete.")
+        await runner.cleanup()
+        await client.stop()
+        await db.close()
+        log.info("Shutdown complete.")
 
 
 if __name__ == "__main__":
